@@ -39,6 +39,9 @@ ESPERAR = ("esperar",)
 # sin impedir que el flujo de asignaciones se mantenga fluido.
 TOPE_INICIATIVA = 5
 VENTANA_INICIATIVA = 32
+# T4.4: vetas con menos de este valor se despachan con un INFORM directo en lugar
+# de abrir una subasta completa (CFP + PROPOSE + ACCEPT/REJECT ≈ 5-9 mensajes).
+UMBRAL_VALOR_SUBASTA = 3
 
 
 # Sesión 2: el estado indica qué está haciendo cada robot y cuándo debe cambiar.
@@ -89,6 +92,9 @@ class Subasta:
     candidatos: tuple
     vence: int
     pujas: dict = field(default_factory=dict)
+    # T4.3: total de pujas esperadas (candidatos + iniciador si también puja).
+    # Permite cerrar la subasta antes del vencimiento cuando ya llegaron todas.
+    pujas_esperadas: int = 0
 
 
 @dataclass
@@ -149,6 +155,10 @@ class Equipo3(EquipoBase):
         self.recepciones_tareas = 0
         self.recepciones_gobernanza = 0
         self.resultado_eleccion = None
+        # T4.7: métricas de anti-duplicación — solo estadística, nunca se leen para decidir.
+        self._registro_asignaciones: dict = {}   # {clave_tarea: (tick, unidad_id)}
+        self.asignaciones_totales = 0
+        self.asignaciones_solapadas = 0
 
     def decidir_unidad(self, unidad: UnidadVista, percepcion: Percepcion, api) -> tuple:
         inicio = perf_counter()
@@ -508,6 +518,14 @@ class Equipo3(EquipoBase):
             m.rescates.pop(tarea.clave, None)
             self._emitir(u, api, tarea.identificador, "AGREE", tarea.conversacion,
                          {"espera": max(24, distancia(u.pos, tarea.pos) * 2 + 8)})
+        # T4.7: registramos la asignación para detectar solapamientos en el informe.
+        # Nunca se usa para tomar decisiones; es puro conteo estadístico.
+        self.asignaciones_totales += 1
+        if tarea.tipo != "rescate":
+            anterior = self._registro_asignaciones.get(tarea.clave)
+            if anterior and p.tick - anterior[0] <= 60:
+                self.asignaciones_solapadas += 1
+            self._registro_asignaciones[tarea.clave] = (p.tick, u.id)
 
     def _abrir_subasta(self, u, p, m, tarea, riesgo, api, candidatos):
         conversacion = f"{u.id}:{p.tick}:{tarea.tipo}"
@@ -516,13 +534,21 @@ class Equipo3(EquipoBase):
             valor = self._valor(u, p, m, tarea, riesgo)
             if valor > float("-inf"):
                 m.subasta.pujas[u.id] = valor
+        # T4.3: fijamos cuántas pujas esperamos para poder cerrar antes del vencimiento.
+        m.subasta.pujas_esperadas = len(candidatos) + (1 if u.id in m.subasta.pujas else 0)
         datos = {**tarea.datos(), "vence": m.subasta.vence}
         for candidato in candidatos:
             self._emitir(u, api, candidato, "CFP", conversacion, datos)
 
     def _cerrar_subasta(self, u, p, m, riesgo, api):
         subasta = m.subasta
-        if not subasta or p.tick < subasta.vence:
+        if not subasta:
+            return
+        # T4.3: cierre anticipado si ya llegaron todas las pujas esperadas; si no,
+        # esperamos hasta el vencimiento original.
+        todo_llegado = (subasta.pujas_esperadas > 0
+                        and len(subasta.pujas) >= subasta.pujas_esperadas)
+        if not todo_llegado and p.tick < subasta.vence:
             return
         m.subasta = None
         tarea = subasta.tarea
@@ -532,17 +558,30 @@ class Equipo3(EquipoBase):
         if u.id in pujas and not self._disponible(u, p, m, tarea):
             pujas.pop(u.id)
         ganador = min(pujas, key=lambda uid: (-pujas[uid], uid)) if pujas else None
-        for perdedor in subasta.candidatos:
-            acto = "ACCEPT_PROPOSAL" if perdedor == ganador else "REJECT_PROPOSAL"
-            self._emitir(u, api, perdedor, acto, subasta.conversacion, tarea.datos())
+        # T4.1: ACCEPT al ganador y REJECT solo a quienes realmente pujaron y no
+        # ganaron. Los candidatos que no respondieron no reciben nada: el silencio
+        # equivale a rechazo. Así eliminamos los REJECT innecesarios del original.
         if ganador == u.id:
             self._asignar(u, p, m, tarea, api)
         elif ganador:
+            self._emitir(u, api, ganador, "ACCEPT_PROPOSAL", subasta.conversacion, tarea.datos())
             m.reservas[tarea.clave] = p.tick + (42 if tarea.tipo == "rescate" else 18)
-        elif tarea.tipo == "rescate":
-            self._emitir(u, api, tarea.identificador, "FAILURE", tarea.conversacion, {})
-            m.rescates.pop(tarea.clave, None)
-        elif u.tipo != ROVER:
+            # T4.6: el iniciador retira el rescate de su cola al despachar el ganador,
+            # evitando que abra otra subasta para el mismo rover en un tick futuro.
+            if tarea.tipo == "rescate":
+                m.rescates.pop(tarea.clave, None)
+        else:
+            # Sin pujas: notificamos el fallo según el tipo de tarea.
+            if tarea.tipo == "rescate":
+                self._emitir(u, api, tarea.identificador, "FAILURE", tarea.conversacion, {})
+                m.rescates.pop(tarea.clave, None)
+        # REJECT solo a los contratistas que enviaron PROPOSE y no ganaron (excluimos al
+        # propio iniciador u.id que nunca recibe mensajes de sí mismo).
+        for perdedor_id in pujas:
+            if perdedor_id != ganador and perdedor_id != u.id:
+                self._emitir(u, api, perdedor_id, "REJECT_PROPOSAL",
+                             subasta.conversacion, tarea.datos())
+        if not ganador and u.tipo != ROVER:
             # Si nadie pujó y el hallazgo viene de un dron, avisamos al rover más cercano.
             # T3.1: contamos el intento y solo sumamos al exitoso si el motor lo entrega.
             self.envios_api += 1
@@ -559,6 +598,12 @@ class Equipo3(EquipoBase):
         return aliado.get("tipo") or self.rol_por_id.get(aliado["id"])
 
     def _candidatos(self, u, p, tarea, rol, limite=2):
+        """Devuelve hasta `limite` candidatos al rol pedido ordenados por cercanía a la tarea.
+
+        T4.2: se elimina el filtro por carga y capacidad porque esos campos no
+        existen en la percepción de aliados_visible. La disponibilidad real la
+        comprueba el propio contratista en _disponible cuando recibe el CFP.
+        """
         posibles = []
         for a in p.aliados_visible:
             if (a["id"] == u.id or self._rol(a) != rol
@@ -566,8 +611,6 @@ class Equipo3(EquipoBase):
                 continue
             pos = tuple(a["pos"])
             if rol == RECARGA and distancia(pos, p.base_pos) > 2:
-                continue
-            if rol == ROVER and a.get("carga", 0) >= a.get("capacidad", 5):
                 continue
             posibles.append((distancia(pos, tarea.pos), -a["bateria"], a["id"]))
         return tuple(x[2] for x in sorted(posibles)[:limite])
@@ -603,6 +646,19 @@ class Equipo3(EquipoBase):
                 return
             m.iniciativas_en_ventana += 1
             vecinos = self._candidatos(u, p, tarea, ROVER)
+            # T4.4: si no hay candidatos visibles o la veta es pequeña, el aviso directo
+            # es más barato que abrir una subasta (CFP + PROPOSE + ACCEPT ≈ 5-9 mensajes).
+            if not vecinos or tarea.valor < UMBRAL_VALOR_SUBASTA:
+                self.envios_api += 1
+                sobre = {
+                    "performative": "INFORM", "sender": u.id,
+                    "conversation_id": f"{u.id}:{p.tick}:directo", "ontology": ONTOLOGIA,
+                    "content": tarea.datos(),
+                }
+                if api.enviar_a_rover_ocioso_cercano(ASUNTO, sobre, pos_ref=tarea.pos) is not None:
+                    self.exitosos_api += 1
+                    self.envios_tareas += 1
+                return
             self._abrir_subasta(u, p, m, tarea, riesgo, api, vecinos)
 
     def _aliado_para_transferir(self, u, p):
@@ -618,10 +674,11 @@ class Equipo3(EquipoBase):
             return False
         alcance = int(tarea.tipo == "restos")
         llegada = distancia(u.pos, tarea.pos)
+        # T4.2: quitamos a.get("carga") < a.get("capacidad") porque esos campos
+        # no existen en la percepción; la condición siempre era True (0 < 5).
         return any(
             a["id"] != u.id and self._rol(a) == ROVER
             and a.get("estado") in ("activo", "consumiendo") and a.get("bateria", 0) > 25
-            and (tarea.tipo == "restos" or a.get("carga", 0) < a.get("capacidad", 5))
             and (distancia(tuple(a["pos"]), tarea.pos), a["id"]) < (llegada, u.id)
             and distancia(tuple(a["pos"]), tarea.pos) <= alcance + 1
             for a in p.aliados_visible
