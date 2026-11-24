@@ -34,6 +34,12 @@ ONTOLOGIA = "marte.grupo3"
 ASUNTO = "marte.acl"
 ESPERAR = ("esperar",)
 
+# T3.3: un dron no puede abrir más de TOPE_INICIATIVA subastas en VENTANA_INICIATIVA ticks.
+# Evita saturar el canal cuando muchos drones ven el mismo hallazgo a la vez,
+# sin impedir que el flujo de asignaciones se mantenga fluido.
+TOPE_INICIATIVA = 5
+VENTANA_INICIATIVA = 32
+
 
 # Sesión 2: el estado indica qué está haciendo cada robot y cuándo debe cambiar.
 class Estado(Enum):
@@ -105,8 +111,13 @@ class Agente:
     patrulla: int = 0
     reintento: int = 0
     intentos: int = 0
+    # T3.4: evita enviar otro REQUEST mientras el recargador ya confirmó con AGREE.
+    acuerdo_en_vuelo: bool = False
     ultima_limpieza: int = -100
     siguiente_reporte: int = 0
+    # T3.3: ventana de tasa de iniciativa para no saturar el canal con subastas.
+    iniciativas_en_ventana: int = 0
+    tick_ventana_iniciativa: int = -100
     politica: str = AHORRO
     ronda: int = -1
     eleccion: tuple | None = None
@@ -128,8 +139,15 @@ class Equipo3(EquipoBase):
         self.cache_riesgo = {}
         self.segundos_turno = 0.0
         self.latencias = deque(maxlen=4096)
-        self.envios_api = 0
-        self.recepciones = 0
+        # T3.1/T3.2: intentos totales de envío y exitosos confirmados por el motor.
+        # Los exitosos se desglosan por tipo de tráfico para el informe.
+        self.envios_api = 0          # intentos (el motor puede rechazar el envío)
+        self.exitosos_api = 0        # envíos que el motor confirmó como entregados
+        self.envios_tareas = 0       # exitosos de tráfico FIPA-ACL de tareas
+        self.envios_gobernanza = 0   # exitosos de tráfico de gobernanza (sesión 5)
+        self.recepciones = 0         # mensajes recibidos totales
+        self.recepciones_tareas = 0
+        self.recepciones_gobernanza = 0
         self.resultado_eleccion = None
 
     def decidir_unidad(self, unidad: UnidadVista, percepcion: Percepcion, api) -> tuple:
@@ -146,7 +164,7 @@ class Equipo3(EquipoBase):
             self.segundos_turno += perf_counter() - inicio
 
     def perfil_rendimiento(self):
-        """Devuelve latencias en ms para la ventana de los últimos 4096 turnos."""
+        """Devuelve latencias en ms y estadísticas de mensajería para los últimos 4096 turnos."""
         muestras = sorted([*self.latencias, self.segundos_turno * 1000])
         return {
             "turnos": len(muestras),
@@ -154,8 +172,14 @@ class Equipo3(EquipoBase):
             "p95_ms": muestras[(95 * len(muestras) - 1) // 100],
             "p99_ms": muestras[(99 * len(muestras) - 1) // 100],
             "max_ms": muestras[-1],
+            # T3.1: intentos vs confirmados (la diferencia revela rechazos del motor).
             "intentos_envio": self.envios_api,
-            "mensajes_recibidos": self.recepciones,
+            "exitosos_envio": self.exitosos_api,
+            # T3.2: desglose por tipo de tráfico.
+            "envios_tareas": self.envios_tareas,
+            "envios_gobernanza": self.envios_gobernanza,
+            "recepciones_tareas": self.recepciones_tareas,
+            "recepciones_gobernanza": self.recepciones_gobernanza,
         }
 
     def _decidir(self, u, p, api):
@@ -188,6 +212,8 @@ class Equipo3(EquipoBase):
                 m.intentos = 0
                 m.reintento = 0
                 m.solicitud = ""
+                # T3.4: el rover ya fue recargado; liberamos el acuerdo en vuelo.
+                m.acuerdo_en_vuelo = False
         elif u.bateria <= UMBRAL_BATERIA_BAJA:
             self._cancelar_rescate(u, m, api)
             return self._volver_dron(u, m, p, riesgo)
@@ -342,17 +368,40 @@ class Equipo3(EquipoBase):
                 - peligro * max(exposicion, riesgo_vuelta))
 
     def _emitir(self, u, api, receptor, acto, conversacion, contenido):
+        """Envía un mensaje FIPA-ACL y registra el resultado.
+
+        T3.1: contamos el intento siempre, pero solo sumamos al exitoso si el
+        motor confirma la entrega (True para enviar_mensaje, id no-None para
+        enviar_a_recargador_cercano).
+        T3.2: clasificamos el exitoso como tarea o gobernanza según el contenido.
+        """
+        # Contamos el intento antes de saber si el motor lo acepta.
         self.envios_api += 1
         sobre = {
             "performative": acto, "sender": u.id, "conversation_id": conversacion,
             "ontology": ONTOLOGIA, "content": contenido,
         }
         if receptor is None:
-            return api.enviar_a_recargador_cercano(ASUNTO, sobre)
-        return api.enviar_mensaje(receptor, ASUNTO, sobre)
+            resultado = api.enviar_a_recargador_cercano(ASUNTO, sobre)
+            ok = resultado is not None
+        else:
+            resultado = api.enviar_mensaje(receptor, ASUNTO, sobre)
+            ok = bool(resultado)
+        # Solo registramos el envío exitoso y lo clasificamos por tipo de tráfico.
+        if ok:
+            self.exitosos_api += 1
+            if isinstance(contenido, dict) and "gobernanza" in contenido:
+                self.envios_gobernanza += 1
+            else:
+                self.envios_tareas += 1
+        return resultado
 
     def _pedir_auxilio(self, u, p, m, api):
         if p.tick < m.reintento or u.bateria <= 2:
+            return
+        # T3.4: si ya tenemos un AGREE en vuelo no enviamos otro REQUEST;
+        # esperamos a que el recargador llegue o nos comunique un FAILURE.
+        if m.acuerdo_en_vuelo:
             return
         conversacion = f"{u.id}:auxilio:{p.tick}"
         tarea = Tarea("rescate", u.pos, u.bateria, p.tick, u.id, conversacion)
@@ -379,38 +428,46 @@ class Equipo3(EquipoBase):
             emisor = mensaje.get("sender")
             conversacion = mensaje.get("conversation_id")
             datos = mensaje["content"]
+            # T3.2: separamos el tráfico de gobernanza del de tareas en recepción.
             if "gobernanza" in datos:
+                self.recepciones_gobernanza += 1
                 self._mensaje_gobierno(u, p, m, api, acto, emisor, conversacion, datos)
-            elif acto == "REQUEST" and u.tipo == RECARGA:
-                tarea = Tarea.desde(datos)
-                m.rescates[tarea.clave] = tarea
-            elif acto == "CFP" and m.oferta is None and m.subasta is None:
-                tarea = Tarea.desde(datos)
-                if self._disponible(u, p, m, tarea):
-                    valor = self._valor(u, p, m, tarea, riesgo)
-                    if valor > float("-inf") and p.tick < datos["vence"]:
-                        m.oferta = conversacion, datos["vence"] + 4
-                        self._emitir(u, api, emisor, "PROPOSE", conversacion, {"valor": valor})
-            elif acto == "PROPOSE" and m.subasta and conversacion == m.subasta.conversacion:
-                if emisor in m.subasta.candidatos:
-                    m.subasta.pujas[emisor] = datos["valor"]
-            elif acto in ("ACCEPT_PROPOSAL", "REJECT_PROPOSAL") and m.oferta:
-                if conversacion == m.oferta[0]:
-                    m.oferta = None
-                    if acto == "ACCEPT_PROPOSAL":
-                        tarea = Tarea.desde(datos)
-                        if self._disponible(u, p, m, tarea):
-                            self._asignar(u, p, m, tarea, api, emisor)
-                        elif tarea.tipo == "rescate":
-                            self._emitir(u, api, tarea.identificador, "FAILURE",
-                                         tarea.conversacion, {})
-            elif u.tipo == ROVER and conversacion == m.solicitud:
-                if acto == "AGREE":
-                    m.reintento = max(m.reintento, p.tick + datos.get("espera", 24))
-                elif acto == "FAILURE":
-                    m.reintento = min(m.reintento, p.tick + 2)
-            elif acto == "INFORM":
-                self._incorporar_informe(p, m, datos)
+            else:
+                self.recepciones_tareas += 1
+                if acto == "REQUEST" and u.tipo == RECARGA:
+                    tarea = Tarea.desde(datos)
+                    m.rescates[tarea.clave] = tarea
+                elif acto == "CFP" and m.oferta is None and m.subasta is None:
+                    tarea = Tarea.desde(datos)
+                    if self._disponible(u, p, m, tarea):
+                        valor = self._valor(u, p, m, tarea, riesgo)
+                        if valor > float("-inf") and p.tick < datos["vence"]:
+                            m.oferta = conversacion, datos["vence"] + 4
+                            self._emitir(u, api, emisor, "PROPOSE", conversacion, {"valor": valor})
+                elif acto == "PROPOSE" and m.subasta and conversacion == m.subasta.conversacion:
+                    if emisor in m.subasta.candidatos:
+                        m.subasta.pujas[emisor] = datos["valor"]
+                elif acto in ("ACCEPT_PROPOSAL", "REJECT_PROPOSAL") and m.oferta:
+                    if conversacion == m.oferta[0]:
+                        m.oferta = None
+                        if acto == "ACCEPT_PROPOSAL":
+                            tarea = Tarea.desde(datos)
+                            if self._disponible(u, p, m, tarea):
+                                self._asignar(u, p, m, tarea, api, emisor)
+                            elif tarea.tipo == "rescate":
+                                self._emitir(u, api, tarea.identificador, "FAILURE",
+                                             tarea.conversacion, {})
+                elif u.tipo == ROVER and conversacion == m.solicitud:
+                    if acto == "AGREE":
+                        # T3.4: marcamos el acuerdo para no reenviar REQUEST innecesarios.
+                        m.acuerdo_en_vuelo = True
+                        m.reintento = max(m.reintento, p.tick + datos.get("espera", 24))
+                    elif acto == "FAILURE":
+                        # T3.4: el acuerdo falló; el reintento va pronto a otro recargador.
+                        m.acuerdo_en_vuelo = False
+                        m.reintento = min(m.reintento, p.tick + 2)
+                elif acto == "INFORM":
+                    self._incorporar_informe(p, m, datos)
 
     def _incorporar_informe(self, p, m, datos):
         tarea = Tarea.desde(datos)
@@ -486,13 +543,17 @@ class Equipo3(EquipoBase):
             self._emitir(u, api, tarea.identificador, "FAILURE", tarea.conversacion, {})
             m.rescates.pop(tarea.clave, None)
         elif u.tipo != ROVER:
+            # Si nadie pujó y el hallazgo viene de un dron, avisamos al rover más cercano.
+            # T3.1: contamos el intento y solo sumamos al exitoso si el motor lo entrega.
+            self.envios_api += 1
             sobre = {
                 "performative": "INFORM", "sender": u.id,
                 "conversation_id": subasta.conversacion, "ontology": ONTOLOGIA,
                 "content": tarea.datos(),
             }
-            self.envios_api += 1
-            api.enviar_a_rover_ocioso_cercano(ASUNTO, sobre, pos_ref=tarea.pos)
+            if api.enviar_a_rover_ocioso_cercano(ASUNTO, sobre, pos_ref=tarea.pos) is not None:
+                self.exitosos_api += 1
+                self.envios_tareas += 1
 
     def _rol(self, aliado):
         return aliado.get("tipo") or self.rol_por_id.get(aliado["id"])
@@ -533,6 +594,14 @@ class Equipo3(EquipoBase):
             ))
             m.reportados[tarea.clave] = p.tick
             m.siguiente_reporte = p.tick + max(7, espera // 4)
+            # T3.3: tope de iniciativa por ventana de ticks — reiniciamos el contador
+            # cuando la ventana expira y bloqueamos si ya se alcanzó el tope.
+            if p.tick - m.tick_ventana_iniciativa >= VENTANA_INICIATIVA:
+                m.tick_ventana_iniciativa = p.tick
+                m.iniciativas_en_ventana = 0
+            if m.iniciativas_en_ventana >= TOPE_INICIATIVA:
+                return
+            m.iniciativas_en_ventana += 1
             vecinos = self._candidatos(u, p, tarea, ROVER)
             self._abrir_subasta(u, p, m, tarea, riesgo, api, vecinos)
 
