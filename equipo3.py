@@ -46,6 +46,12 @@ CONDUCTA = {
 COSTO_HIELO_BARATO = 4.0
 COSTO_HIELO_CARO = 10.0
 ARRANQUE = 120
+# A partir de este tick (2 rondas de votación) la partida se considera larga: el
+# hielo de costo medio ya no compensa porque la batería sigue sumando mientras la
+# partida no termina. Desde ahí solo el hielo barato mantiene al equipo activo;
+# si no, repliegue. Probamos 300, 450, 600, 900 y 1200: cortar en 2 rondas dio el
+# mejor Ratio sin bajar casi el hielo recogido.
+PARTIDA_LARGA = 2 * 240
 SIN_HIELO = (REPLIEGUE, AHORRO, SUPERVIVENCIA, EXPANSION)
 # Sesión 5: orden fijo de las candidatas. Sirve para armar la matriz de Copeland
 # siempre igual y como último criterio de desempate.
@@ -1054,7 +1060,8 @@ class Equipo3(EquipoBase):
 
         La idea es votar según cuánto cuesta conseguir hielo ahora: si conozco
         hielo barato conviene salir (expansión); si es caro, gastar menos
-        (ahorro); si no conozco nada pasado el arranque, replegarse. El peligro
+        (ahorro); si no conozco nada pasado el arranque, replegarse. Cuando la
+        partida se alarga, solo el hielo barato justifica seguir saliendo. El peligro
         inmediato (batería baja, carroña, tormentas) tiene prioridad.
         """
         if p.fase_final:
@@ -1064,14 +1071,17 @@ class Equipo3(EquipoBase):
             return (SUPERVIVENCIA, AHORRO, REPLIEGUE, EXPANSION)
         # Solo cuenta una tormenta encima o a punto de alcanzarnos; una lejana
         # dentro del rango de visión no cambia lo que conviene al equipo.
+        larga = p.tick >= PARTIDA_LARGA
         if u.en_tormenta or any(
             distancia(u.pos, (round(x), round(y))) <= r + 2 for x, y, r in p.tormentas_visible
         ):
+            if larga:
+                return (REPLIEGUE, AHORRO, SUPERVIVENCIA, EXPANSION)
             return (AHORRO, SUPERVIVENCIA, REPLIEGUE, EXPANSION)
         costo = self._costo_hielo(p, m)
         if costo <= COSTO_HIELO_BARATO:
             return (EXPANSION, AHORRO, SUPERVIVENCIA, REPLIEGUE)
-        if costo <= COSTO_HIELO_CARO:
+        if costo <= COSTO_HIELO_CARO and not larga:
             return (AHORRO, EXPANSION, REPLIEGUE, SUPERVIVENCIA)
         if p.tick < ARRANQUE:
             # Al inicio nadie conoce hielo todavía: hay que salir a buscarlo.
