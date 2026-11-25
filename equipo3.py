@@ -117,8 +117,8 @@ class Agente:
     patrulla: int = 0
     reintento: int = 0
     intentos: int = 0
-    # T3.4: evita enviar otro REQUEST mientras el recargador ya confirmó con AGREE.
-    acuerdo_en_vuelo: bool = False
+    # T3.4: tick hasta el cual hay un AGREE vigente; si el dron muere en camino, expira solo.
+    acuerdo_hasta: int = -1
     ultima_limpieza: int = -100
     siguiente_reporte: int = 0
     # T3.3: ventana de tasa de iniciativa para no saturar el canal con subastas.
@@ -222,8 +222,8 @@ class Equipo3(EquipoBase):
                 m.intentos = 0
                 m.reintento = 0
                 m.solicitud = ""
-                # T3.4: el rover ya fue recargado; liberamos el acuerdo en vuelo.
-                m.acuerdo_en_vuelo = False
+                # T3.4: el rover ya fue recargado; liberamos la vigencia del acuerdo.
+                m.acuerdo_hasta = -1
         elif u.bateria <= UMBRAL_BATERIA_BAJA:
             self._cancelar_rescate(u, m, api)
             return self._volver_dron(u, m, p, riesgo)
@@ -409,11 +409,12 @@ class Equipo3(EquipoBase):
     def _pedir_auxilio(self, u, p, m, api):
         if p.tick < m.reintento or u.bateria <= 2:
             return
-        # T3.4: si ya tenemos un AGREE en vuelo no enviamos otro REQUEST;
-        # esperamos a que el recargador llegue o nos comunique un FAILURE.
-        if m.acuerdo_en_vuelo:
+        # T3.4: si hay un AGREE vigente no enviamos otro REQUEST; si el dron muere
+        # en camino, acuerdo_hasta expira y el rover vuelve a pedir auxilio.
+        if p.tick < m.acuerdo_hasta:
             return
-        conversacion = f"{u.id}:auxilio:{p.tick}"
+        sufijo = ":r" if m.intentos else ""
+        conversacion = f"{u.id}:auxilio:{p.tick}{sufijo}"
         tarea = Tarea("rescate", u.pos, u.bateria, p.tick, u.id, conversacion)
         drones = self.roles[RECARGA]
         receptor = None
@@ -467,14 +468,21 @@ class Equipo3(EquipoBase):
                             elif tarea.tipo == "rescate":
                                 self._emitir(u, api, tarea.identificador, "FAILURE",
                                              tarea.conversacion, {})
-                elif u.tipo == ROVER and conversacion == m.solicitud:
+                elif u.tipo == ROVER and conversacion and conversacion.startswith(f"{u.id}:auxilio:"):
                     if acto == "AGREE":
-                        # T3.4: marcamos el acuerdo para no reenviar REQUEST innecesarios.
-                        m.acuerdo_en_vuelo = True
-                        m.reintento = max(m.reintento, p.tick + datos.get("espera", 24))
-                    elif acto == "FAILURE":
-                        # T3.4: el acuerdo falló; el reintento va pronto a otro recargador.
-                        m.acuerdo_en_vuelo = False
+                        # Si ya hay otro recargador en camino con acuerdo vigente, avisamos
+                        # al segundo dron para que aborte y no vayan dos al mismo rover.
+                        if p.tick < m.acuerdo_hasta:
+                            cierre = Tarea("rescate", u.pos, 0, p.tick, u.id, conversacion)
+                            self._emitir(u, api, emisor, "INFORM", conversacion, cierre.datos())
+                        else:
+                            # Aceptamos también AGREE tardío de un pedido anterior para evitar doble despacho.
+                            espera = datos.get("espera", 24)
+                            m.acuerdo_hasta = p.tick + espera
+                            m.reintento = max(m.reintento, m.acuerdo_hasta)
+                    elif acto == "FAILURE" and conversacion == m.solicitud:
+                        # El acuerdo vigente falló; el reintento va pronto a otro recargador.
+                        m.acuerdo_hasta = -1
                         m.reintento = min(m.reintento, p.tick + 2)
                 elif acto == "INFORM":
                     self._incorporar_informe(p, m, datos)
@@ -483,6 +491,12 @@ class Equipo3(EquipoBase):
         tarea = Tarea.desde(datos)
         if tarea.tipo == "rescate":
             m.rescates.pop(tarea.clave, None)
+            # Si el rover avisó que ya tiene otro recargador en camino, abortamos este rescate.
+            if (m.objetivo and m.objetivo.tipo == "rescate"
+                    and m.objetivo.clave == tarea.clave
+                    and m.objetivo.conversacion == tarea.conversacion):
+                m.objetivo = None
+                m.estado = Estado.RETORNANDO_BASE
             return
         mapa = m.hielo if tarea.tipo == "hielo" else m.restos
         anterior = mapa.get(tarea.pos)
@@ -518,6 +532,12 @@ class Equipo3(EquipoBase):
             m.rescates.pop(tarea.clave, None)
             self._emitir(u, api, tarea.identificador, "AGREE", tarea.conversacion,
                          {"espera": max(24, distancia(u.pos, tarea.pos) * 2 + 8)})
+            # Solo si el pedido viene de un reintento (:r), otros recargadores pueden
+            # tenerlo en sus colas; les avisamos por INFORM para evitar rescates duplicados.
+            if tarea.conversacion.endswith(":r"):
+                cierre = Tarea("rescate", tarea.pos, 0, p.tick, tarea.identificador, "")
+                for otro_id in self._candidatos(u, p, tarea, RECARGA, limite=5):
+                    self._emitir(u, api, otro_id, "INFORM", f"{u.id}:cierre:{p.tick}", cierre.datos())
         # T4.7: registramos la asignación para detectar solapamientos en el informe.
         # Nunca se usa para tomar decisiones; es puro conteo estadístico.
         self.asignaciones_totales += 1
@@ -611,6 +631,10 @@ class Equipo3(EquipoBase):
                 continue
             pos = tuple(a["pos"])
             if rol == RECARGA and distancia(pos, p.base_pos) > 2:
+                continue
+            # Rovers a <= 5 celdas de una veta o resto ya lo ven por sí mismos en _observar;
+            # enviarles CFP suele generar subastas sin pujas porque ya van hacia allá.
+            if rol == ROVER and tarea.tipo in ("hielo", "restos") and distancia(pos, tarea.pos) <= 5:
                 continue
             posibles.append((distancia(pos, tarea.pos), -a["bateria"], a["id"]))
         return tuple(x[2] for x in sorted(posibles)[:limite])
@@ -736,17 +760,9 @@ class Equipo3(EquipoBase):
         if tarea is None and m.oferta is None and m.subasta is None:
             tarea = self._objetivo_rover(u, p, m, riesgo)
             if tarea:
-                vecinos = self._candidatos(u, p, tarea, ROVER)
-                competidores = tuple(
-                    uid for uid in vecinos if uid < u.id
-                )
-                # Si ya está en posición, extraer resulta más barato que negociar.
-                if competidores and distancia(u.pos, tarea.pos) in (2, 3, 4, 5):
-                    self._abrir_subasta(u, p, m, tarea, riesgo, api, competidores)
-                    m.reservas[tarea.clave] = p.tick + 6
-                    tarea = None
-                else:
-                    self._asignar(u, p, m, tarea, api)
+                # Asignación directa: las subastas entre rovers cercanos casi nunca
+                # reciben pujas y dejan al rover parado esperando el vencimiento.
+                self._asignar(u, p, m, tarea, api)
         if tarea:
             cerca = distancia(u.pos, tarea.pos) <= int(tarea.tipo == "restos")
             if tarea.tipo == "hielo":
@@ -824,11 +840,13 @@ class Equipo3(EquipoBase):
             m.patrulla += 1
         return self._mover(u, p, m, destino, riesgo)
 
-    def _cancelar_rescate(self, u, m, api):
+    def _cancelar_rescate(self, u, m, api, notificar=True):
         tarea = m.objetivo
         if tarea and tarea.tipo == "rescate":
             m.objetivo = None
-            if u.bateria > 2:
+            # Solo enviamos FAILURE si el rover sigue esperando; si ya murió o fue
+            # atendido por otro dron evitamos gastar mensajes inútiles.
+            if notificar and u.bateria > 2:
                 self._emitir(u, api, tarea.identificador, "FAILURE",
                              tarea.conversacion, {})
 
@@ -840,10 +858,15 @@ class Equipo3(EquipoBase):
             tarea = m.objetivo
             rover = next((a for a in p.aliados_visible if a["id"] == tarea.identificador), None)
             destino = tuple(rover["pos"]) if rover else tarea.pos
-            if (p.tick > m.vigencia or (rover and rover["estado"] == "muerto")
-                    or (rover and rover["estado"] != "esperando_recarga"
-                        and rover["bateria"] > tarea.valor + 5)):
-                self._cancelar_rescate(u, m, api)
+            atendido_o_muerto = bool(
+                rover and (
+                    rover["estado"] == "muerto"
+                    or (rover["estado"] != "esperando_recarga"
+                        and rover["bateria"] > tarea.valor + 5)
+                )
+            )
+            if p.tick > m.vigencia or atendido_o_muerto:
+                self._cancelar_rescate(u, m, api, notificar=not atendido_o_muerto)
                 return self._volver_dron(u, m, p, riesgo)
             if distancia(u.pos, destino) <= 1:
                 m.objetivo = None
@@ -867,8 +890,14 @@ class Equipo3(EquipoBase):
             tarea = min(pendientes, key=lambda t: (
                 t.valor, distancia(u.pos, t.pos), t.tick, t.identificador,
             ))
-            vecinos = self._candidatos(u, p, tarea, RECARGA)
-            self._abrir_subasta(u, p, m, tarea, riesgo, api, vecinos)
+            # Si solo hay un pedido y este recargador puede atenderlo, se autoasigna
+            # sin abrir subasta entre pares que están todos en la misma base.
+            if (len(pendientes) == 1 and self._disponible(u, p, m, tarea)
+                    and self._valor(u, p, m, tarea, riesgo) > float("-inf")):
+                self._asignar(u, p, m, tarea, api)
+            else:
+                vecinos = self._candidatos(u, p, tarea, RECARGA)
+                self._abrir_subasta(u, p, m, tarea, riesgo, api, vecinos)
         return ESPERAR
 
     def _preferencias(self, u, p):
