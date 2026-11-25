@@ -7,7 +7,7 @@ from itertools import combinations
 from time import perf_counter
 
 from equipo_base import (
-    EquipoBase, Percepcion, UnidadVista, UMBRAL_BATERIA_BAJA,
+    CAPACIDAD_ROVER, EquipoBase, Percepcion, UnidadVista, UMBRAL_BATERIA_BAJA,
     distancia_chebyshev as distancia,
 )
 
@@ -30,6 +30,33 @@ POLITICAS = {
     SUPERVIVENCIA: (3.5, 3.0, 4.0, 5.0, 3, 42),
     REPLIEGUE: (3.0, 4.5, 3.0, 5.5, 4, 64),
 }
+# Sesión 5: además de los pesos de U(s,a), cada política fija cuánto se explora:
+# vueltas que da cada explorador a su sector por ronda de votación (None = sin
+# límite) y si un rover que no conoce hielo sale a buscarlo o espera en base.
+# La exploración sin rumbo es el mayor gasto del equipo, así que esta es la
+# palanca que más mueve el Ratio.
+CONDUCTA = {
+    AHORRO: {"vueltas_explorador": 1, "rover_busca": True},
+    EXPANSION: {"vueltas_explorador": None, "rover_busca": True},
+    SUPERVIVENCIA: {"vueltas_explorador": 1, "rover_busca": False},
+    REPLIEGUE: {"vueltas_explorador": 0, "rover_busca": False},
+}
+# Sesión 5: umbrales de las preferencias, en batería por unidad de hielo
+# (ver _costo_hielo). Una veta de 5 a 10 celdas de la base cuesta 4.
+COSTO_HIELO_BARATO = 4.0
+COSTO_HIELO_CARO = 10.0
+ARRANQUE = 120
+SIN_HIELO = (REPLIEGUE, AHORRO, SUPERVIVENCIA, EXPANSION)
+# Sesión 5: orden fijo de las candidatas. Sirve para armar la matriz de Copeland
+# siempre igual y como último criterio de desempate.
+CANDIDATAS = (AHORRO, SUPERVIVENCIA, EXPANSION, REPLIEGUE)
+PERIODO_VOTACION = 240
+# Si el coordinador de la ronda no publica resultado en este tiempo (murió o se
+# quedó sin batería), el siguiente recargador de la lista abre la votación.
+VENTANA_COORDINADOR = 24
+# Cada cuántas rondas se reenvía la política aunque no haya cambiado, para
+# corregir a las unidades que se quedaron con un valor viejo.
+REFRESCO_POLITICA = 3
 ONTOLOGIA = "marte.grupo3"
 ASUNTO = "marte.acl"
 ESPERAR = ("esperar",)
@@ -115,6 +142,10 @@ class Agente:
     solicitud: str = ""
     vigencia: int = 0
     patrulla: int = 0
+    # Sesión 5: puntos de patrulla visitados en la ronda de votación actual; con
+    # CONDUCTA limita cuánto explora cada dron según la política vigente.
+    ronda_patrulla: int = -1
+    puntos_ronda: int = 0
     reintento: int = 0
     intentos: int = 0
     # T3.4: tick hasta el cual hay un AGREE vigente; si el dron muere en camino, expira solo.
@@ -155,6 +186,9 @@ class Equipo3(EquipoBase):
         self.recepciones_tareas = 0
         self.recepciones_gobernanza = 0
         self.resultado_eleccion = None
+        # Sesión 5: una entrada por votación resuelta (matriz, puntos, empates y
+        # ciclos). Solo se usa para el informe; ninguna unidad decide leyendo esto.
+        self.historial_elecciones = []
         # T4.7: métricas de anti-duplicación — solo estadística, nunca se leen para decidir.
         self._registro_asignaciones: dict = {}   # {clave_tarea: (tick, unidad_id)}
         self.asignaciones_totales = 0
@@ -788,6 +822,10 @@ class Equipo3(EquipoBase):
         if u.bateria <= reserva + ida and not p.base_aliada_cerca:
             # Volver antes de agotar la batería facilita un rescate cercano.
             return self._volver_rover(u, p, m, riesgo)
+        if not CONDUCTA[m.politica]["rover_busca"]:
+            # Sin hielo conocido y con una política conservadora, el rover espera en
+            # base. Ahí le llegan los INFORM de los exploradores sobre vetas nuevas.
+            return self._volver_rover(u, p, m, riesgo)
         return self._avanzar_busqueda(u, p, m, riesgo)
 
     def _avanzar_busqueda(self, u, p, m, riesgo):
@@ -825,6 +863,14 @@ class Equipo3(EquipoBase):
         vuelta, _ = self._ruta(u.pos, p.base_pos, riesgo, u.tipo, 2)
         if p.fase_final or m.estado == Estado.RETORNANDO_BASE or u.bateria <= 31 + vuelta:
             return self._volver_dron(u, m, p, riesgo)
+        ronda = p.tick // PERIODO_VOTACION
+        if m.ronda_patrulla != ronda:
+            m.ronda_patrulla, m.puntos_ronda = ronda, 0
+        limite = CONDUCTA[m.politica]["vueltas_explorador"]
+        if limite is not None and m.puntos_ronda >= 4 * limite:
+            # Ya cubrió lo que la política permite en esta ronda: espera en base,
+            # donde no gasta batería, hasta la próxima ronda o un cambio de política.
+            return self._volver_dron(u, m, p, riesgo)
 
         self._reportar(u, p, m, riesgo, api)
         m.estado = Estado.PATRULLANDO
@@ -838,6 +884,7 @@ class Equipo3(EquipoBase):
         destino = abs(bx - x), abs(by - y)
         if distancia(u.pos, destino) <= 1:
             m.patrulla += 1
+            m.puntos_ronda += 1
         return self._mover(u, p, m, destino, riesgo)
 
     def _cancelar_rescate(self, u, m, api, notificar=True):
@@ -900,30 +947,63 @@ class Equipo3(EquipoBase):
                 self._abrir_subasta(u, p, m, tarea, riesgo, api, vecinos)
         return ESPERAR
 
-    def _preferencias(self, u, p):
+    def _costo_hielo(self, p, m):
+        """Batería por unidad de hielo de la veta más barata que esta unidad conoce.
+
+        Ida y vuelta desde la base dividida por lo que un rover puede traer de esa
+        veta (máximo 5). Solo usa la memoria propia (lo visto o recibido por
+        mensaje), nunca datos de otras unidades.
+        """
+        mejor = float("inf")
+        for t in m.hielo.values():
+            if p.tick - t.tick <= 90 and t.valor > 0:
+                viaje = 2 * distancia(p.base_pos, t.pos)
+                mejor = min(mejor, viaje / min(CAPACIDAD_ROVER, t.valor))
+        return mejor
+
+    def _preferencias(self, u, p, m):
+        """Orden de preferencia de una unidad según su situación local.
+
+        La idea es votar según cuánto cuesta conseguir hielo ahora: si conozco
+        hielo barato conviene salir (expansión); si es caro, gastar menos
+        (ahorro); si no conozco nada pasado el arranque, replegarse. El peligro
+        inmediato (batería baja, carroña, tormentas) tiene prioridad.
+        """
         if p.fase_final:
             return (REPLIEGUE, SUPERVIVENCIA, AHORRO, EXPANSION)
-        if u.bateria < 45 or len(p.restos_visible) >= 2:
+        pedidos = len(m.rescates) if u.tipo == RECARGA else 0
+        if u.bateria < 45 or len(p.restos_visible) >= 2 or pedidos >= 2:
             return (SUPERVIVENCIA, AHORRO, REPLIEGUE, EXPANSION)
-        if u.en_tormenta or p.tormentas_visible:
+        # Solo cuenta una tormenta encima o a punto de alcanzarnos; una lejana
+        # dentro del rango de visión no cambia lo que conviene al equipo.
+        if u.en_tormenta or any(
+            distancia(u.pos, (round(x), round(y))) <= r + 2 for x, y, r in p.tormentas_visible
+        ):
             return (AHORRO, SUPERVIVENCIA, REPLIEGUE, EXPANSION)
-        if sum(cantidad >= 4 for _, _, cantidad in p.hielo_visible) >= 2:
+        costo = self._costo_hielo(p, m)
+        if costo <= COSTO_HIELO_BARATO:
             return (EXPANSION, AHORRO, SUPERVIVENCIA, REPLIEGUE)
-        if p.tick >= 360 and not p.hielo_visible:
-            return (REPLIEGUE, AHORRO, SUPERVIVENCIA, EXPANSION)
-        return (AHORRO, EXPANSION, SUPERVIVENCIA, REPLIEGUE)
+        if costo <= COSTO_HIELO_CARO:
+            return (AHORRO, EXPANSION, REPLIEGUE, SUPERVIVENCIA)
+        if p.tick < ARRANQUE:
+            # Al inicio nadie conoce hielo todavía: hay que salir a buscarlo.
+            return (EXPANSION, AHORRO, SUPERVIVENCIA, REPLIEGUE)
+        return SIN_HIELO
 
     def _mensaje_gobierno(self, u, p, m, api, acto, emisor, conversacion, datos):
         tipo = datos["gobernanza"]
         ronda = datos["ronda"]
         if acto == "CFP" and tipo == "voto" and u.bateria > 35:
             self._emitir(u, api, emisor, "PROPOSE", conversacion, {
-                "gobernanza": "voto", "ronda": ronda, "orden": self._preferencias(u, p),
+                "gobernanza": "voto", "ronda": ronda, "orden": self._preferencias(u, p, m),
             })
         elif acto == "PROPOSE" and m.eleccion and ronda == m.eleccion[0]:
             _, _, elegibles, votos = m.eleccion
-            if emisor in elegibles:
-                votos[emisor] = tuple(datos["orden"])
+            orden = tuple(datos.get("orden", ()))
+            # Solo contamos papeletas completas: un orden con políticas repetidas o
+            # faltantes rompería el conteo por pares de Copeland.
+            if emisor in elegibles and sorted(orden) == sorted(CANDIDATAS):
+                votos[emisor] = orden
         elif acto == "INFORM" and ronda > m.ronda:
             m.ronda = ronda
             m.politica = datos["politica"]
@@ -935,16 +1015,24 @@ class Equipo3(EquipoBase):
             m.politica = REPLIEGUE
             return
         recargadores = self.roles[RECARGA]
-        ronda, tramo = divmod(p.tick, 240)
+        ronda, tramo = divmod(p.tick, PERIODO_VOTACION)
         if m.difusion and u.bateria > 35:
             for _ in range(min(3, len(m.difusion))):
                 uid, anterior, politica = m.difusion.popleft()
                 self._emitir(u, api, uid, "INFORM", f"votacion:{anterior}", {
                     "gobernanza": "politica", "ronda": anterior, "politica": politica,
                 })
-        if not recargadores or u.id != recargadores[ronda % len(recargadores)]:
+        if not recargadores or tramo < 12:
             return
-        if 12 <= tramo <= 18 and m.eleccion is None and m.ronda < ronda:
+        # El coordinador rota por ronda. Si en VENTANA_COORDINADOR ticks no llegó el
+        # resultado (m.ronda sigue atrasada), la posta pasa al siguiente recargador.
+        # Así una ronda no se pierde si el coordinador murió o no tiene batería.
+        turno, desfase = divmod(tramo - 12, VENTANA_COORDINADOR)
+        if turno >= len(recargadores):
+            return
+        if u.id != recargadores[(ronda + turno) % len(recargadores)]:
+            return
+        if desfase <= 6 and m.eleccion is None and m.ronda < ronda and u.bateria > 35:
             panel = []
             for rol, n in ((ROVER, 4), (EXPLORADOR, 2), (RECARGA, 1)):
                 lista = self.roles[rol]
@@ -953,41 +1041,91 @@ class Equipo3(EquipoBase):
                     panel.extend(
                         lista[(inicio + i) % len(lista)] for i in range(min(n, len(lista)))
                     )
-            elegibles = tuple(uid for uid in panel if uid != u.id)
-            m.eleccion = ronda, p.tick + 9, elegibles, {u.id: self._preferencias(u, p)}
+            elegibles = tuple(dict.fromkeys(uid for uid in panel if uid != u.id))
+            m.eleccion = ronda, p.tick + 9, elegibles, {u.id: self._preferencias(u, p, m)}
             for uid in elegibles:
                 self._emitir(u, api, uid, "CFP", f"votacion:{ronda}", {
                     "gobernanza": "voto", "ronda": ronda,
                 })
-        if m.eleccion and p.tick >= m.eleccion[1]:
-            self._resolver_eleccion(u, m, api)
+        if m.eleccion:
+            _, vence, elegibles, votos = m.eleccion
+            # Cerramos antes si ya votaron todos; si no, al vencer el plazo.
+            if p.tick >= vence or len(votos) > len(elegibles):
+                self._resolver_eleccion(u, p, m, api)
 
-    def _resolver_eleccion(self, u, m, api):
-        ronda, _, _, votos = m.eleccion
-        m.eleccion = None
-        orden = (AHORRO, SUPERVIVENCIA, EXPANSION, REPLIEGUE)
-        puntos = dict.fromkeys(orden, 0)
+    @staticmethod
+    def _copeland(votos):
+        """Cuenta la elección por pares y devuelve puntos, márgenes, matriz,
+        ganador de Condorcet (o None) y si hay un ciclo de mayorías.
+
+        Copeland: en cada par gana quien está antes en más papeletas. Ganar suma 1,
+        perder resta 1 y empatar no suma. El margen es la suma de (a favor - en
+        contra) en todos los pares y se usa para desempatar.
+        """
+        puntos = dict.fromkeys(CANDIDATAS, 0)
+        margen = dict.fromkeys(CANDIDATAS, 0)
         matriz = {}
-        for a, b in combinations(orden, 2):
+        for a, b in combinations(CANDIDATAS, 2):
             favor = sum(voto.index(a) < voto.index(b) for voto in votos.values())
             contra = len(votos) - favor
             matriz[a, b], matriz[b, a] = favor, contra
             diferencia = int(favor > contra) - int(contra > favor)
             puntos[a] += diferencia
             puntos[b] -= diferencia
-        politica = max(orden, key=puntos.get)
+            margen[a] += favor - contra
+            margen[b] += contra - favor
+        # Ganador de Condorcet: le gana por mayoría estricta a todas las demás.
+        condorcet = next((c for c in CANDIDATAS
+                          if puntos[c] == len(CANDIDATAS) - 1), None)
+        # Ciclo: tres políticas donde a vence a b, b a c y c a a (paradoja de Condorcet).
+        gana = {(a, b) for (a, b), f in matriz.items() if f > matriz[b, a]}
+        ciclo = any(
+            ((a, b) in gana and (b, c) in gana and (c, a) in gana)
+            or ((a, c) in gana and (c, b) in gana and (b, a) in gana)
+            for a, b, c in combinations(CANDIDATAS, 3)
+        )
+        return puntos, margen, matriz, condorcet, ciclo
+
+    def _resolver_eleccion(self, u, p, m, api):
+        ronda, _, _, votos = m.eleccion
+        m.eleccion = None
+        anterior = m.politica
+        puntos, margen, matriz, condorcet, ciclo = self._copeland(votos)
+        mejor = max(puntos.values())
+        empatadas = [c for c in CANDIDATAS if puntos[c] == mejor]
+        # Desempate en tres pasos: 1) mayor margen total, 2) quedarse con la política
+        # vigente (evita cambiar de rumbo por un voto), 3) orden fijo de CANDIDATAS.
+        politica = condorcet or min(empatadas, key=lambda c: (
+            -margen[c], c != anterior, CANDIDATAS.index(c),
+        ))
+        if condorcet:
+            criterio = "condorcet"
+        elif len(empatadas) == 1:
+            criterio = "copeland"
+        elif len({margen[c] for c in empatadas}) == len(empatadas):
+            criterio = "margen"
+        else:
+            criterio = "vigente" if anterior in empatadas else "orden_fijo"
         m.ronda, m.politica = ronda, politica
         self.resultado_eleccion = {
-            "ronda": ronda, "politica": politica, "votos": len(votos),
-            "copeland": puntos, "comparaciones": matriz,
+            "ronda": ronda, "tick": p.tick, "coordinador": u.id, "politica": politica,
+            "anterior": anterior, "votos": len(votos), "copeland": puntos,
+            "margen": margen, "comparaciones": matriz, "condorcet": condorcet,
+            "ciclo": ciclo, "empate": len(empatadas) > 1, "criterio": criterio,
         }
+        self.historial_elecciones.append(self.resultado_eleccion)
+        # Si la política no cambió no hace falta avisar a rovers y exploradores:
+        # siguen con la que tienen. Se reenvía igual cada REFRESCO_POLITICA rondas.
+        avisar = politica != anterior or ronda % REFRESCO_POLITICA == 0
         relevos = self.roles[RECARGA]
-        destinatarios = self.roles[ROVER] + self.roles[EXPLORADOR]
+        destinatarios = self.roles[ROVER] + self.roles[EXPLORADOR] if avisar else []
         for i, uid in enumerate(relevos):
             grupo = destinatarios[i::len(relevos)]
             if uid == u.id:
                 m.difusion.extend((receptor, ronda, politica) for receptor in grupo)
             else:
+                # Los demás recargadores siempre reciben el resultado: así saben que
+                # la ronda ya se resolvió y no abren una votación de respaldo.
                 self._emitir(u, api, uid, "INFORM", f"votacion:{ronda}", {
                     "gobernanza": "relevo", "ronda": ronda,
                     "politica": politica, "destinos": grupo,
