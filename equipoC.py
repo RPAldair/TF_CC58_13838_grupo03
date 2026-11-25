@@ -57,6 +57,13 @@ VENTANA_COORDINADOR = 24
 # Cada cuántas rondas se reenvía la política aunque no haya cambiado, para
 # corregir a las unidades que se quedaron con un valor viejo.
 REFRESCO_POLITICA = 3
+# Sesión 6: el enunciado pide menos de 40 ms por turno para todo el equipo. Si
+# el turno ya gastó PRESUPUESTO_MS, las unidades que faltan deciden en modo
+# económico (menos opciones evaluadas, reportes postergados) para no pasarse.
+LIMITE_TURNO_MS = 40.0
+PRESUPUESTO_MS = 30.0
+# Capas que se miden por separado con perf_counter (tabla de profiling).
+CAPAS = ("percepcion", "mensajeria", "gobernanza", "coordinacion", "decision")
 ONTOLOGIA = "marte.grupo3"
 ASUNTO = "marte.acl"
 ESPERAR = ("esperar",)
@@ -176,6 +183,16 @@ class Equipo3(EquipoBase):
         self.cache_riesgo = {}
         self.segundos_turno = 0.0
         self.latencias = deque(maxlen=4096)
+        # Sesión 6: tiempo de cada capa dentro del turno y su historial.
+        self.capas_turno = dict.fromkeys(CAPAS, 0.0)
+        self.latencias_capa = {capa: deque(maxlen=4096) for capa in CAPAS}
+        self._marca_tiempo = 0.0
+        self.economico = False
+        self.decisiones_economicas = 0
+        self.turnos_con_recorte = 0
+        self.turnos_sobre_limite = 0
+        self._recorte_en_turno = False
+        self._vistos = {ROVER: [], EXPLORADOR: [], RECARGA: []}
         # T3.1/T3.2: intentos totales de envío y exitosos confirmados por el motor.
         # Los exitosos se desglosan por tipo de tráfico para el informe.
         self.envios_api = 0          # intentos (el motor puede rechazar el envío)
@@ -198,24 +215,63 @@ class Equipo3(EquipoBase):
         inicio = perf_counter()
         if percepcion.tick != self.tick:
             if self.tick is not None:
-                self.latencias.append(self.segundos_turno * 1000)
+                self._cerrar_turno()
             self.tick = percepcion.tick
             self.segundos_turno = 0.0
             self.cache_riesgo.clear()
+        # Sesión 6: el turno es la suma de todas las unidades del equipo en el
+        # mismo tick. Si ya va por el presupuesto, esta unidad decide en modo
+        # económico. Nunca se espera ni se bloquea: solo se evalúa menos.
+        self.economico = self.segundos_turno * 1000 >= PRESUPUESTO_MS
+        if self.economico:
+            self.decisiones_economicas += 1
+            self._recorte_en_turno = True
+        self._marca_tiempo = inicio
         try:
             return self._decidir(unidad, percepcion, api)
         finally:
+            # Lo que quede desde la última marca es la decisión por rol.
+            self._marcar("decision")
             self.segundos_turno += perf_counter() - inicio
 
-    def perfil_rendimiento(self):
-        """Devuelve latencias en ms y estadísticas de mensajería para los últimos 4096 turnos."""
-        muestras = sorted([*self.latencias, self.segundos_turno * 1000])
+    def _marcar(self, capa):
+        ahora = perf_counter()
+        self.capas_turno[capa] += ahora - self._marca_tiempo
+        self._marca_tiempo = ahora
+
+    def _cerrar_turno(self):
+        ms = self.segundos_turno * 1000
+        self.latencias.append(ms)
+        self.turnos_sobre_limite += ms > LIMITE_TURNO_MS
+        self.turnos_con_recorte += self._recorte_en_turno
+        self._recorte_en_turno = False
+        for capa in CAPAS:
+            self.latencias_capa[capa].append(self.capas_turno[capa] * 1000)
+            self.capas_turno[capa] = 0.0
+
+    @staticmethod
+    def _estadisticas(valores):
+        muestras = sorted(valores)
+        if not muestras:
+            return {"media_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0}
         return {
-            "turnos": len(muestras),
             "media_ms": sum(muestras) / len(muestras),
             "p95_ms": muestras[(95 * len(muestras) - 1) // 100],
             "p99_ms": muestras[(99 * len(muestras) - 1) // 100],
             "max_ms": muestras[-1],
+        }
+
+    def perfil_rendimiento(self):
+        """Devuelve latencias en ms y estadísticas de mensajería para los últimos 4096 turnos."""
+        muestras = [*self.latencias, self.segundos_turno * 1000]
+        return {
+            "turnos": len(muestras),
+            **self._estadisticas(muestras),
+            # Sesión 6: desglose por capa (media, p95, p99 y máximo por turno).
+            "capas": {capa: self._estadisticas(v) for capa, v in self.latencias_capa.items()},
+            "turnos_sobre_40ms": self.turnos_sobre_limite,
+            "turnos_con_modo_economico": self.turnos_con_recorte,
+            "decisiones_economicas": self.decisiones_economicas,
             # T3.1: intentos vs confirmados (la diferencia revela rechazos del motor).
             "intentos_envio": self.envios_api,
             "exitosos_envio": self.exitosos_api,
@@ -240,7 +296,10 @@ class Equipo3(EquipoBase):
         m = self.agentes[u.id]
         riesgo = self._campo_riesgo(p)
         self._observar(u, p, m)
+        self._indexar_aliados(p)
+        self._marcar("percepcion")
         self._mensajes(u, p, m, riesgo, api)
+        self._marcar("mensajeria")
         if u.tipo == ROVER:
             if u.estado == "consumiendo":
                 m.estado = Estado.CONSUMIENDO_CARRONA
@@ -263,15 +322,38 @@ class Equipo3(EquipoBase):
             return self._volver_dron(u, m, p, riesgo)
 
         self._gobernar(u, p, m, api)
+        self._marcar("gobernanza")
         self._cerrar_subasta(u, p, m, riesgo, api)
+        self._marcar("coordinacion")
         if u.tipo == ROVER:
             return self._rover(u, p, m, riesgo, api)
         if u.tipo == RECARGA:
             return self._recargador(u, p, m, riesgo, api)
         return self._explorador(u, p, m, riesgo, api)
 
+    def _indexar_aliados(self, p):
+        """Agrupa por rol los aliados que ve esta unidad, una sola vez por decisión.
+
+        Sesión 6: _candidatos, _otro_ocupa y _aliado_para_transferir recorrían
+        aliados_visible completo en cada llamada (hasta 10 veces por rover). Con
+        el índice cada consulta solo mira el rol que le interesa. Se rehace en
+        cada decisión con la percepción de la propia unidad: no se mezcla lo que
+        ven unidades distintas.
+        """
+        vistos = {ROVER: [], EXPLORADOR: [], RECARGA: []}
+        for a in p.aliados_visible:
+            rol = self._rol(a)
+            if rol in vistos:
+                vistos[rol].append((tuple(a["pos"]), a))
+        self._vistos = vistos
+
     def _campo_riesgo(self, p):
-        """Precalcula cada tormenta visible una vez por tick y su unión local."""
+        """Precalcula cada tormenta visible una vez por tick y su unión local.
+
+        Sesión 6: la caché se indexa por las tormentas exactas que ve la unidad,
+        así que dos unidades solo comparten cálculo si ven lo mismo. Es memoizar
+        una función pura, no pasar información entre unidades.
+        """
         firma = tuple(sorted(tuple(t) for t in p.tormentas_visible))
         clave = ("campo", firma)
         campo = self.cache_riesgo.get(clave)
@@ -659,11 +741,10 @@ class Equipo3(EquipoBase):
         comprueba el propio contratista en _disponible cuando recibe el CFP.
         """
         posibles = []
-        for a in p.aliados_visible:
-            if (a["id"] == u.id or self._rol(a) != rol
+        for pos, a in self._vistos.get(rol, ()):
+            if (a["id"] == u.id
                     or a.get("estado") != "activo" or a.get("bateria", 0) <= 30):
                 continue
-            pos = tuple(a["pos"])
             if rol == RECARGA and distancia(pos, p.base_pos) > 2:
                 continue
             # Rovers a <= 5 celdas de una veta o resto ya lo ven por sí mismos en _observar;
@@ -674,7 +755,10 @@ class Equipo3(EquipoBase):
         return tuple(x[2] for x in sorted(posibles)[:limite])
 
     def _reportar(self, u, p, m, riesgo, api):
-        if p.fase_final or m.subasta or p.tick < m.siguiente_reporte or u.bateria < 40:
+        # Sesión 6: en modo económico el reporte se deja para el siguiente tick;
+        # la veta sigue en memoria y no se pierde nada por esperar.
+        if (self.economico or p.fase_final or m.subasta
+                or p.tick < m.siguiente_reporte or u.bateria < 40):
             return
         minimo, espera = POLITICAS[m.politica][4:]
         hallazgos = [
@@ -721,9 +805,9 @@ class Equipo3(EquipoBase):
 
     def _aliado_para_transferir(self, u, p):
         return min(
-            (a for a in p.aliados_visible if a["id"] != u.id
-             and self._rol(a) == ROVER and a.get("estado") != "muerto"
-             and a.get("bateria", 100) < 55 and distancia(u.pos, tuple(a["pos"])) <= 1),
+            (a for pos, a in self._vistos[ROVER] if a["id"] != u.id
+             and a.get("estado") != "muerto"
+             and a.get("bateria", 100) < 55 and distancia(u.pos, pos) <= 1),
             key=lambda a: (a["bateria"], a["id"]), default=None,
         )
 
@@ -734,13 +818,16 @@ class Equipo3(EquipoBase):
         llegada = distancia(u.pos, tarea.pos)
         # T4.2: quitamos a.get("carga") < a.get("capacidad") porque esos campos
         # no existen en la percepción; la condición siempre era True (0 < 5).
-        return any(
-            a["id"] != u.id and self._rol(a) == ROVER
-            and a.get("estado") in ("activo", "consumiendo") and a.get("bateria", 0) > 25
-            and (distancia(tuple(a["pos"]), tarea.pos), a["id"]) < (llegada, u.id)
-            and distancia(tuple(a["pos"]), tarea.pos) <= alcance + 1
-            for a in p.aliados_visible
-        )
+        # Sesión 6: mismo criterio que antes, pero solo sobre rovers ya indexados y
+        # calculando la distancia una vez por aliado.
+        for pos, a in self._vistos[ROVER]:
+            if (a["id"] == u.id or a.get("estado") not in ("activo", "consumiendo")
+                    or a.get("bateria", 0) <= 25):
+                continue
+            cerca = distancia(pos, tarea.pos)
+            if cerca <= alcance + 1 and (cerca, a["id"]) < (llegada, u.id):
+                return True
+        return False
 
     def _objetivo_rover(self, u, p, m, riesgo):
         # Acotamos la evaluación de ruta a los candidatos que mas convengan
@@ -750,10 +837,11 @@ class Equipo3(EquipoBase):
             and p.tick >= m.reservas.get(t.clave, 0)
             and distancia(u.pos, t.pos) <= 36
         )
+        # Sesión 6: en modo económico solo se evalúan las 3 opciones más prometedoras.
         opciones = sorted(opciones, key=lambda t: (
             distancia(u.pos, t.pos) - (t.valor if t.tipo == "hielo" else t.valor / 5),
             -t.tick, t.pos,
-        ))[:10]
+        ))[:3 if self.economico else 10]
         mejor = None
         valor = 0.0
         if u.carga:
